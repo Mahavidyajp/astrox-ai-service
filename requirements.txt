@@ -1,0 +1,37 @@
+# ============================================================
+# ASTROX AI service — Python dependencies (app-level only)
+# Jetson Orin Nano · JetPack 6 / L4T r36.x · Python 3.10 · venv
+#
+#   pip install -r requirements.txt
+#
+# On the Jetson, ultralytics' heavy deps already come from JetPack —
+# install it without pulling them:
+#   pip install --no-deps ultralytics ultralytics-thop
+# ============================================================
+
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9      # multipart/form-data for UploadFile
+pydantic>=2.6
+PyYAML>=6.0                  # cameras.yaml / bytetrack.yaml
+numpy>=1.24
+ultralytics>=8.2            # YOLO + ByteTrack + TensorRT engine
+ultralytics-thop>=2.0
+aiortc>=1.9.0               # legacy WebRTC offer path (camera/webrtc.py)
+
+# ------------------------------------------------------------
+# NOT installed via pip — provided by JetPack or apt.
+# Installing these from PyPI on the Jetson BREAKS the CUDA/TensorRT
+# stack. Left here only as documentation.
+#
+#   torch, torchvision   -> NVIDIA Jetson wheels (bundled with JetPack)
+#   tensorrt             -> ships with JetPack
+#   opencv (cv2)         -> JetPack's GStreamer/CUDA-enabled build
+#   PyGObject (gi) + GStreamer 1.0:
+#     sudo apt install python3-gi gir1.2-gstreamer-1.0 \
+#       gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base \
+#       gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+#       gstreamer1.0-plugins-ugly gstreamer1.0-libav v4l-utils
+#   av (PyAV)            -> dependency of aiortc; needs FFmpeg dev
+#                          headers at build time (README_CAMERA_PIPELINE.md §5)
+# ------------------------------------------------------------

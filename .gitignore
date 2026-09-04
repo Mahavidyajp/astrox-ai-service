@@ -1,0 +1,23 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime artifacts
+outputs/*
+uploads/*
+recordings/*
+!outputs/.gitkeep
+!uploads/.gitkeep
+!recordings/.gitkeep
+
+# Local config / secrets — commit cameras.yaml.example instead
+cameras.yaml
+.env
+
+# Model weights: device-specific, large, rebuildable from best.pt
+*.engine
+*.pt
+*.onnx

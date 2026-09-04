@@ -1,0 +1,106 @@
+# ByteTrack config for ASTROX drone detection (video + webcam tracking).
+#
+# Referenced by detector.py via an absolute path, so this file (not
+# whatever ships inside the installed `ultralytics` package) is always
+# the one actually used, regardless of process cwd.
+#
+# CORRECTION: an earlier version of this file set track_high_thresh
+# and new_track_thresh higher than this, based on an assumption about
+# what Ultralytics' packaged default was -- that assumption was wrong
+# and was never actually verified against the installed package on
+# this device. The real installed default (confirmed via
+# venv/lib/python3.10/site-packages/ultralytics/cfg/trackers/bytetrack.yaml)
+# is track_high_thresh=0.25 / new_track_thresh=0.25, not 0.5 / 0.6.
+# The inflated new_track_thresh in particular meant any detection
+# scoring between 0.25 and 0.6 -- a completely normal confidence range
+# for a live webcam feed with real-world lighting/motion/angle
+# variation -- was too weak to ever be confirmed as a track, so
+# webcam detections silently produced zero confirmed objects even
+# though inference itself was running correctly. Both values are now
+# reverted to match the verified installed default exactly.
+#
+# Only ONE value is intentionally changed from the verified installed
+# default: track_buffer, for the specific, documented reason below.
+# Every other value matches
+# venv/lib/python3.10/site-packages/ultralytics/cfg/trackers/bytetrack.yaml
+# on this device exactly.
+#
+# HOW THESE THRESHOLDS ARE ACTUALLY FED (webcam path):
+# camera/manager.py's inference worker calls
+#   detector.track_frame(frame, conf=min(track_low_thresh, operator_threshold))
+# i.e. it hands model.track() the LOW floor below, NOT the operator's
+# display/confidence-slider value. That value is applied afterward, in
+# the worker, to decide what is drawn and counted. This matters:
+# model.track()'s `conf` prunes boxes BEFORE ByteTrack runs, so if the
+# operator threshold were passed there, every detection between
+# track_low_thresh and track_high_thresh would be gone before the
+# second-stage association below could use it -- the exact mechanism
+# that was causing tracks to be lost on a brief confidence dip and
+# re-created with a new id (ID churn / runaway track ids). detector.py
+# reads track_low_thresh straight out of this file
+# (Detector.tracker_feed_conf); keep that key present and numeric.
+
+tracker_type: bytetrack
+
+# First-stage match threshold. Matches the verified installed default.
+# Raise this later only with real evidence from this project's actual
+# footage that low-confidence boxes are being matched into tracks they
+# shouldn't be (ID drift onto background/noise).
+track_high_thresh: 0.25
+
+# Second-stage threshold, for recovering an already-active track
+# through a confidence dip (motion blur, partial occlusion). Matches
+# the verified installed default.
+#
+# This is ALSO the value camera/manager.py feeds into model.track() as
+# its detection `conf` (see the "HOW THESE THRESHOLDS ARE ACTUALLY
+# FED" note above), so that detections in
+# [track_low_thresh, track_high_thresh) actually reach this stage
+# instead of being pruned by Ultralytics first. If you lower this,
+# you also lower the floor of what the model returns for tracking; if
+# you raise it above track_high_thresh you disable second-stage
+# recovery entirely. Change with footage evidence, not a guess.
+track_low_thresh: 0.1
+
+# Confidence required to START a brand-new track. Matches the verified
+# installed default. This is the value that was previously (wrongly)
+# raised to 0.6, which is what broke webcam detection -- see the
+# CORRECTION note above. Note this still gates new-track creation even
+# though model.track() is now fed the lower track_low_thresh: a weak
+# box can help SUSTAIN an existing track without being strong enough
+# to CREATE one.
+new_track_thresh: 0.25
+
+# HOW LONG (in frames) a track without any matching detection is kept
+# alive before being marked lost/removed. This is the one value
+# intentionally changed from the verified installed default of 30.
+#
+# CHANGED: 30 -> 60.
+#
+# Why: 30 frames is only ~1 second of buffer at 30fps. Real-world
+# causes of a drone momentarily not being detected -- motion blur from
+# fast motion, brief occlusion behind terrain/objects, compression
+# artifacts on a video upload, a transient inference miss, or the
+# camera itself panning -- can easily span more than 1 second,
+# especially at lower/variable webcam FPS. Doubling to 60 frames
+# (~2 seconds at 30fps, correspondingly longer at lower FPS since this
+# is a frame count, not a time duration) gives meaningfully more
+# tolerance for exactly this gap scenario, without being large enough
+# to plausibly stitch two genuinely different drones together into one
+# track (ByteTrack's own motion-matching still has to agree the
+# reappearing box is a plausible continuation of the lost track's
+# estimated position, not just any new box).
+#
+# If real deployment footage shows tracks still splitting on
+# occlusions longer than ~2s, or the opposite failure (two different
+# drones merged into one ID), this is the value to revisit -- based on
+# measured footage, not another guess.
+track_buffer: 150
+
+# IoU threshold for matching a detection box to a track's predicted
+# position. Matches the verified installed default.
+match_thresh: 0.8
+
+# Whether detection confidence is fused into the matching score.
+# Matches the verified installed default.
+fuse_score: True

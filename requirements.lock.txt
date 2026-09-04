@@ -1,0 +1,13 @@
+aiortc==1.15.0
+anyio==4.14.2
+av==17.1.0
+fastapi==0.141.1
+h11==0.16.0
+numpy==1.26.4
+pydantic==2.13.5
+python-multipart==0.0.32
+PyYAML==6.0.3
+starlette==1.6.0
+ultralytics==8.4.135
+ultralytics-thop==2.1.6
+uvicorn==0.52.4

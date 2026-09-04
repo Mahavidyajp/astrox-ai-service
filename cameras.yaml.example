@@ -1,0 +1,40 @@
+# Copy this file to cameras.yaml and edit for your deployment.
+# USB and HDMI capture cards on /dev/videoN are auto-discovered and do
+# NOT need an entry here (see auto_discover_usb below). CSI, RTSP, and
+# custom GStreamer sources must be listed explicitly.
+
+auto_discover_usb: true
+
+csi_cameras:
+  - id: csi-0
+    name: "CSI Camera 0"
+    sensor_id: 0
+    width: 1280
+    height: 720
+    fps: 30
+
+  # - id: csi-1
+  #   name: "CSI Camera 1"
+  #   sensor_id: 1
+  #   width: 1920
+  #   height: 1080
+  #   fps: 30
+
+rtsp_cameras:
+  - id: rtsp-0
+    name: "Front gate IP camera"
+    # Prefer an env var for credentials rather than committing them here:
+    #   url: "rtsp://${RTSP_USER}:${RTSP_PASS}@192.168.1.50:554/stream1"
+    url: "rtsp://192.168.1.50:554/stream1"
+    codec: h264            # h264 | h265
+    rtsp_latency_ms: 100   # rtspsrc jitterbuffer size; lower = less latency, less loss tolerance
+    rtsp_protocol: tcp     # tcp | udp
+
+custom_cameras: []
+  # - id: custom-thermal-0
+  #   name: "Thermal camera"
+  #   pipeline: >
+  #     v4l2src device=/dev/video4 !
+  #     video/x-raw,format=GRAY16_LE,width=640,height=512 !
+  #     videoconvert ! video/x-raw,format=BGR !
+  #     appsink name=sink
