@@ -1,0 +1,23 @@
+logLevel: info
+
+rtsp: yes
+# Loopback only — the Jetson publisher connects over 127.0.0.1;
+# nothing off-box needs raw RTSP.
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: no
+webrtcLocalUDPAddress: :8189
+# Addresses the browser's ICE must be able to reach MediaMTX on.
+# ZeroTier IP first (works from any network), LAN IP as fallback.
+webrtcAdditionalHosts: [10.45.140.230, 192.168.0.122]
+
+hls: no
+rtmp: no
+srt: no
+
+paths:
+  cam:
+    source: publisher
