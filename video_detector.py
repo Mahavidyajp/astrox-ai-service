@@ -7,6 +7,13 @@ from collections import Counter
 
 _default_detector = None
 
+# Phase B: how many of the detected frames to record into stats["frames"].
+# 1 = every frame that had a tracked detection. Raise via env for very
+# long videos to keep the JSON payload small (frontend interpolates
+# between recorded frames). Only frames WITH detections are recorded, so
+# for typical drone footage (1-3 objects) this stays small at stride 1.
+_FRAME_STRIDE = max(1, int(os.getenv("VIDEO_DETECT_FRAME_STRIDE", "1")))
+
 
 def _get_default_detector():
     """
@@ -21,6 +28,24 @@ def _get_default_detector():
         from detector import Detector
         _default_detector = Detector("best.engine")
     return _default_detector
+
+
+def _clamp01(v):
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else float(v)
+
+
+def _norm_bbox(x1, y1, x2, y2, w, h):
+    """Phase B: pixel bbox -> [x1,y1,x2,y2] in 0..1 against a w x h frame.
+    Lets the browser place the box on the original upload at any display
+    size, letterbox-aware, without knowing the source resolution."""
+    if not w or not h:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [
+        round(_clamp01(x1 / w), 6),
+        round(_clamp01(y1 / h), 6),
+        round(_clamp01(x2 / w), 6),
+        round(_clamp01(y2 / h), 6),
+    ]
 
 
 def _reencode_h264(temp_path, final_path):
@@ -78,7 +103,7 @@ def process_video(input_path, output_path, detector=None):
         video_fps = 30.0
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_COUNT and cv2.CAP_PROP_FRAME_HEIGHT))
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -111,6 +136,12 @@ def process_video(input_path, output_path, detector=None):
     # becoming "100 drones".
     tracks: dict[int, dict] = {}
 
+    # Phase B: per-frame detections for the browser canvas overlay on
+    # the ORIGINAL upload. Only frames with >=1 tracked detection are
+    # stored, and only every _FRAME_STRIDE-th such frame.
+    frames_out: list = []
+    detected_frame_seen = 0
+
     start_time = time.time()
 
     while True:
@@ -123,6 +154,8 @@ def process_video(input_path, output_path, detector=None):
         result = detector.track_frame(frame)
 
         detections = result.get("detections", [])
+
+        frame_dets = []
 
         for detection in detections:
 
@@ -153,6 +186,15 @@ def process_video(input_path, output_path, detector=None):
             entry["confidences"].append(confidence)
             entry["last_seen_frame"] = processed_frames
 
+            frame_dets.append({
+                "track_id": int(track_id),
+                "class": class_name,
+                "class_id": detection.get("class_id", -1),
+                "confidence": round(float(confidence), 4),
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "bbox_norm": _norm_bbox(x1, y1, x2, y2, width, height),
+            })
+
             cv2.rectangle(
                 frame,
                 (x1, y1),
@@ -175,6 +217,16 @@ def process_video(input_path, output_path, detector=None):
                 2,
                 cv2.LINE_AA
             )
+
+        # Phase B: record this frame's detections (stride-sampled).
+        if frame_dets:
+            if detected_frame_seen % _FRAME_STRIDE == 0:
+                frames_out.append({
+                    "frame": processed_frames,
+                    "t": round(processed_frames / video_fps, 3),
+                    "detections": frame_dets,
+                })
+            detected_frame_seen += 1
 
         writer.write(frame)
 
@@ -229,6 +281,17 @@ def process_video(input_path, output_path, detector=None):
 
     objects_detected = len(track_summaries)
 
+    # Phase B: compact 1..N display id per confirmed track, matching the
+    # order the frontend timeline shows them in. Backfilled into the
+    # per-frame detections so the overlay can label boxes "#1..#N"
+    # instead of raw ByteTrack ids.
+    display_by_track = {
+        t["track_id"]: i + 1 for i, t in enumerate(track_summaries)
+    }
+    for fr in frames_out:
+        for d in fr["detections"]:
+            d["display_id"] = display_by_track.get(d["track_id"])
+
     # Documented rule: the session-level average/max confidence are
     # computed from each UNIQUE TRACK's own average/max confidence --
     # i.e. every physical object contributes exactly once, regardless
@@ -250,14 +313,25 @@ def process_video(input_path, output_path, detector=None):
         "total_frames": total_frames,
         "processed_frames": processed_frames,
         "video_fps": round(video_fps, 2),
+        "fps": round(video_fps, 2),          # Phase B alias for frame<->time mapping
         "processing_fps": round(processing_fps, 2),
         "processing_time": round(elapsed, 2),
         "resolution": f"{width}x{height}",
+        "frame_w": width,                    # Phase B
+        "frame_h": height,                   # Phase B
 
         # UNIQUE tracked objects -- NOT sum(detections per frame).
         "objects_detected": objects_detected,
         "class_counts": class_counts,
         "tracks": track_summaries,
+
+        # Phase B: per-frame tracked detections for a browser canvas
+        # overlay on the ORIGINAL upload. Each detection carries
+        # bbox_norm (0..1 vs frame_w/frame_h) + display_id. Only frames
+        # with detections are included, stride-sampled by _FRAME_STRIDE.
+        "frames": frames_out,
+        "frames_count": len(frames_out),
+        "frames_stride": _FRAME_STRIDE,
 
         # Real aggregate confidence figures (see rule above), None only
         # when nothing was ever tracked.

@@ -12,20 +12,25 @@ Thread-safety model:
 
 Transports that read from this class:
 - Detection JSON, over /webcam/status (polled) and /webcam/ws/detections
-  (pushed) -- driven by the inference worker's output.
+  (pushed) -- driven by the inference worker's output. Every detection
+  carries `bbox` (pixels in the inference frame) AND `bbox_norm`
+  (0..1), plus the payload carries `frame_w`/`frame_h`. The browser
+  overlays using `bbox_norm` so it does not matter that the WHEP video
+  is a different size from the inference frame (Phase B).
 - Raw video frames: streamed to MediaMTX by MediaMTXPublisher via its
   own consumer id on the same LatestFrameBuffer, in its own pipeline.
-  A video/MediaMTX failure there cannot stall or kill inference.
 
-MissionRecorder (see camera/mission.py) sits on top of the session
-state: it times the mission, logs events, and evaluates configurable
-alert rules once per frame. It never tracks/detects/counts -- it only
-observes what this class already computes from detector.names.
+MissionRecorder (camera/mission.py) sits on top of the session state:
+times the mission, logs events, evaluates alert rules once per frame.
 
-Phase A: when a mission is started with recording enabled, an
-independent cv2.VideoWriter (see _record_tick) captures the annotated
-frames to <MISSION_RECORD_DIR>/mission_<session_id>.mp4. It is fully
-decoupled from the MediaMTX publisher and can never stall inference.
+Phase A: recording enabled -> an independent cv2.VideoWriter captures
+the annotated frames to <MISSION_RECORD_DIR>/mission_<session_id>.mp4,
+fully decoupled from the publisher, never able to stall inference.
+
+Phase C: the mission's confidence threshold is set per-mission via
+set_mission_config(confidence=...) from /webcam/session/config
+(Settings -> defaultConfidence). set_confidence() stays as a manual
+override.
 """
 
 from __future__ import annotations
@@ -56,10 +61,6 @@ from .v4l2_source import V4L2CameraSource
 logger = logging.getLogger("camera.manager")
 
 
-# A tracked object must be seen -- at or above the operator confidence
-# threshold -- in at least this many distinct frames before it counts
-# as a confirmed unique object. Applied at the COUNTING layer only;
-# never touches the tracker.
 MIN_TRACK_HITS = 3
 
 _FPS_WINDOW_SAMPLES = 60
@@ -70,23 +71,32 @@ _STALL_SECONDS = 2.0
 # ------------------------------------------------------------------
 # Mission recording (Phase A)
 # ------------------------------------------------------------------
-# Directory is shared with app.py (imported there for the download
-# route). Override with MISSION_RECORD_DIR in the systemd unit.
 MISSION_RECORD_DIR = os.getenv(
     "MISSION_RECORD_DIR",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "recordings")),
 )
 os.makedirs(MISSION_RECORD_DIR, exist_ok=True)
 
-# Playback FPS of the evidence file. The recorder paces writes to wall
-# clock, so playback duration matches real time regardless of the
-# actual inference rate.
 _RECORD_FPS = float(os.getenv("MISSION_RECORD_FPS", "15"))
-# Use the SAME fourcc as video_detector.py so the browser can play it.
-# If a recording won't play, try "avc1" (needs OpenCV built w/ H.264).
-_RECORD_FOURCC = os.getenv("MISSION_RECORD_FOURCC", "mp4v")
+_RECORD_FOURCC = os.getenv("MISSION_RECORD_FOURCC", "mp4v")  # match video_detector.py
 _RECORD_ANNOTATE = os.getenv("MISSION_RECORD_ANNOTATE", "1") == "1"
 _RECORD_MIN_BYTES = 10_000
+
+
+def _clamp01(v: float) -> float:
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else float(v)
+
+
+def _norm_bbox(x1, y1, x2, y2, w, h):
+    """Phase B: pixel bbox -> [x1,y1,x2,y2] in 0..1 against a w x h frame."""
+    if not w or not h:
+        return [0.0, 0.0, 0.0, 0.0]
+    return [
+        round(_clamp01(x1 / w), 6),
+        round(_clamp01(y1 / h), 6),
+        round(_clamp01(x2 / w), 6),
+        round(_clamp01(y2 / h), 6),
+    ]
 
 
 def _queue_put_latest(queue: "asyncio.Queue", payload: dict) -> None:
@@ -115,8 +125,12 @@ class CameraManager:
         self._latest_detections: list = []
         self._last_error: Optional[str] = None
 
-        # SESSION state -- keyed by ByteTrack track_id. NOT cleared by
-        # stop(); only by start() or clear_session().
+        # Phase B: geometry of the frame the model last ran on. The
+        # detections' bbox_norm are normalized against this.
+        self._last_frame_w = 0
+        self._last_frame_h = 0
+
+        # SESSION state -- keyed by ByteTrack track_id.
         self._session_id: Optional[str] = None
         self._session_source = "Webcam"
         self._session_started_at: Optional[str] = None
@@ -124,8 +138,6 @@ class CameraManager:
         self._session_frame_count = 0
         self._session_detections_seen = 0
         self._tracks: dict[int, dict] = {}
-        # track_id -> compact per-mission display number (1..N over the
-        # gated/confirmed set). Refreshed by _build_session_summary().
         self._display_map: dict[int, int] = {}
 
         # Measured statistics only.
@@ -140,9 +152,9 @@ class CameraManager:
         self._mission = MissionRecorder()
         self._pending_alert_rules: list = []
         self._pending_recording = False
+        self._pending_confidence: Optional[float] = None  # Phase C
 
-        # --- mission recording (Phase A); writer opens lazily in
-        # _record_tick() on the first frame of a recording mission ---
+        # --- mission recording (Phase A) ---
         self._recording_enabled = False
         self._record_writer = None
         self._record_path: Optional[str] = None
@@ -162,12 +174,19 @@ class CameraManager:
         )
 
     # ------------------------------------------------------------------
-    # Mission config (set BEFORE /webcam/start)
-    # ------------------------------------------------------------------
-    def set_mission_config(self, *, alert_rules: Optional[list], recording: bool) -> None:
+    def set_mission_config(
+        self,
+        *,
+        alert_rules: Optional[list],
+        recording: bool,
+        confidence: Optional[float] = None,
+    ) -> None:
         with self._lock:
             self._pending_alert_rules = list(alert_rules or [])
             self._pending_recording = bool(recording)
+            self._pending_confidence = (
+                float(confidence) if confidence is not None else None
+            )
 
     # ------------------------------------------------------------------
     # Discovery
@@ -248,6 +267,8 @@ class CameraManager:
                 self._source = source
                 self._latest_detections = []
                 self._last_error = None
+                self._last_frame_w = 0
+                self._last_frame_h = 0
                 self._inference_fps = 0.0
                 self._inference_time_ms = 0.0
                 self._processing_latency_ms = 0.0
@@ -264,6 +285,11 @@ class CameraManager:
                 self._tracks = {}
                 self._display_map = {}
 
+                # Phase C: apply the mission confidence BEFORE begin() so
+                # the recorder logs the value that was actually used.
+                if self._pending_confidence is not None:
+                    self._confidence_threshold = self._pending_confidence
+
                 # NEW MISSION.
                 self._mission.begin(
                     session_id=self._session_id,
@@ -272,10 +298,10 @@ class CameraManager:
                     resolution=resolution,
                     recording_enabled=self._pending_recording,
                     alert_rules=self._pending_alert_rules,
+                    confidence=self._confidence_threshold,
                 )
 
-                # Phase A: arm recording BEFORE the pending flag is
-                # consumed. The writer opens on the first frame.
+                # Phase A: arm recording BEFORE the pending flag is consumed.
                 self._recording_enabled = bool(self._pending_recording)
                 self._record_writer = None
                 self._record_path = None
@@ -283,9 +309,9 @@ class CameraManager:
                 self._record_frames_written = 0
                 self._record_started_monotonic = 0.0
 
-                # consume the pending config
                 self._pending_alert_rules = []
                 self._pending_recording = False
+                self._pending_confidence = None
 
             self._worker_running = True
             self._worker_thread = threading.Thread(target=self._inference_loop, daemon=True)
@@ -301,13 +327,6 @@ class CameraManager:
             }
 
     def stop(self) -> None:
-        """
-        Stops the publisher, the inference worker, and camera capture,
-        finalizes the mission recording (if any), and finalizes the
-        mission (stamps end_time). Does NOT clear the session/mission
-        state -- the operator still gets to see the result. Cleared
-        only by start() or clear_session().
-        """
         self._publisher.stop()
 
         self._worker_running = False
@@ -341,8 +360,9 @@ class CameraManager:
             self._session_detections_seen = 0
             self._tracks = {}
             self._display_map = {}
+            self._last_frame_w = 0
+            self._last_frame_h = 0
             self._mission.clear()
-            # drop any lingering recorder state
             self._recording_enabled = False
             self._safe_close_writer()
             self._record_path = None
@@ -366,6 +386,7 @@ class CameraManager:
                 continue
 
             frame = frame_obj.image
+            frame_h, frame_w = frame.shape[:2]  # Phase B
             inference_start = time.perf_counter()
             frame_age_ms = max(0.0, (time.monotonic() - frame_obj.timestamp) * 1000.0)
 
@@ -396,6 +417,7 @@ class CameraManager:
                 if len(bbox) != 4:
                     continue
                 tid = det.get("track_id")
+                bx1, by1, bx2, by2 = (float(v) for v in bbox)
                 detections.append(
                     {
                         "track_id": tid,
@@ -403,7 +425,9 @@ class CameraManager:
                         "class": det.get("class", "unknown"),
                         "class_id": det.get("class_id", -1),
                         "confidence": round(confidence, 4),
-                        "bbox": [int(v) for v in bbox],
+                        "bbox": [int(bx1), int(by1), int(bx2), int(by2)],
+                        # Phase B: resolution-independent box.
+                        "bbox_norm": _norm_bbox(bx1, by1, bx2, by2, frame_w, frame_h),
                     }
                 )
 
@@ -411,6 +435,8 @@ class CameraManager:
             now_mono = time.monotonic()
             with self._lock:
                 self._latest_detections = detections
+                self._last_frame_w = frame_w
+                self._last_frame_h = frame_h
                 self._inference_time_ms = inference_ms
                 self._last_error = error
                 self._last_frame_monotonic = now_mono
@@ -429,7 +455,6 @@ class CameraManager:
                 resolution = getattr(source, "resolution", None)
                 self._mission.set_resolution(resolution)
 
-                # SESSION accumulation.
                 self._session_frame_count += 1
                 self._session_detections_seen += len(detections)
                 mission_offset = self._mission.offset_now
@@ -464,7 +489,6 @@ class CameraManager:
                         entry["best_confidence"] = conf
                         entry["best_bbox"] = list(bbox)
 
-                # Per-class counts for the mission observer.
                 visible_class_counts: dict = {}
                 for det in detections:
                     visible_class_counts[det["class"]] = visible_class_counts.get(det["class"], 0) + 1
@@ -486,6 +510,8 @@ class CameraManager:
                 frame_id=frame_obj.frame_id,
                 frame_timestamp=frame_obj.timestamp,
                 resolution=resolution,
+                frame_w=frame_w,
+                frame_h=frame_h,
             )
 
             # Phase A -- evidence recording (self-contained, never raises)
@@ -507,7 +533,9 @@ class CameraManager:
         with self._lock:
             self._detection_subscribers.discard(queue)
 
-    def _publish_detections(self, detections, frame_id, frame_timestamp, resolution) -> None:
+    def _publish_detections(
+        self, detections, frame_id, frame_timestamp, resolution, frame_w=None, frame_h=None
+    ) -> None:
         with self._lock:
             subscribers = list(self._detection_subscribers)
             loop = self._loop
@@ -518,6 +546,9 @@ class CameraManager:
             "frame_id": frame_id,
             "timestamp": frame_timestamp,
             "resolution": resolution,
+            # Phase B: the frame bbox_norm is normalized against.
+            "frame_w": frame_w,
+            "frame_h": frame_h,
             "detections": detections,
         }
         for queue in subscribers:
@@ -581,11 +612,6 @@ class CameraManager:
                 logger.exception("VideoWriter.release() failed")
 
     def _record_tick(self, frame, detections) -> None:
-        """One write per inference iteration while recording. Paced to
-        wall clock (writes the last frame repeatedly if inference is
-        slow, skips if fast) so playback duration ~ real time. Any
-        failure disables recording and is swallowed -- inference must
-        never stall."""
         if not self._recording_enabled:
             return
         try:
@@ -633,9 +659,6 @@ class CameraManager:
             self._safe_close_writer()
 
     def _finalize_recording(self) -> Optional[str]:
-        """Release the writer; if a usable file exists, return its
-        relative URL for MissionRecorder.set_video(). Called from stop()
-        AFTER the worker joined."""
         if self._record_writer is None:
             return None
         path = self._record_path
@@ -679,6 +702,8 @@ class CameraManager:
             active = self._source is not None and self._source.is_running
             inference_fps = self._inference_fps
             processing_latency_ms = self._processing_latency_ms
+            frame_w = self._last_frame_w
+            frame_h = self._last_frame_h
             mission_meta = self._mission.to_dict()
 
         confirmed = []
@@ -689,8 +714,6 @@ class CameraManager:
             confirmed.append((track_id, entry))
         confirmed.sort(key=lambda kv: kv[0])
 
-        # Compact display numbering over the confirmed set (fixes the
-        # "#44 / #72" complaint -- these become #1..#N).
         new_display_map = {track_id: i + 1 for i, (track_id, _) in enumerate(confirmed)}
         with self._lock:
             self._display_map = new_display_map
@@ -703,6 +726,13 @@ class CameraManager:
             average_confidence = round(sum(confidences) / len(confidences), 4)
             max_confidence = round(max(confidences), 4)
             duration_s = max(0.0, entry["last_seen_offset"] - entry["first_seen_offset"])
+
+            best_bbox = entry["best_bbox"]
+            rep_bbox_norm = None
+            if frame_w and frame_h and len(best_bbox) == 4:
+                rep_bbox_norm = _norm_bbox(
+                    best_bbox[0], best_bbox[1], best_bbox[2], best_bbox[3], frame_w, frame_h
+                )
 
             tracks.append(
                 {
@@ -717,10 +747,9 @@ class CameraManager:
                     "frames_seen": len(confidences),
                     "average_confidence": average_confidence,
                     "max_confidence": max_confidence,
-                    # Documented representative value (spec section 6):
-                    # confidence/bbox at the highest-confidence frame.
                     "representative_confidence": round(entry["best_confidence"], 4),
-                    "representative_bbox": entry["best_bbox"],
+                    "representative_bbox": best_bbox,
+                    "representative_bbox_norm": rep_bbox_norm,  # Phase B
                     "first_bbox": entry["first_bbox"],
                     "last_bbox": entry["last_bbox"],
                 }
@@ -737,7 +766,6 @@ class CameraManager:
             max_confidence = None
 
         summary = {
-            # ---- existing keys (unchanged, still consumed by webcam.tsx) ----
             "session_id": session_id,
             "source": mission_meta["source_name"],
             "started_at": started_at,
@@ -748,7 +776,6 @@ class CameraManager:
             "tracks": tracks,
             "average_confidence": average_confidence,
             "max_confidence": max_confidence,
-            # ---- mission layer (all additive) ----
             "mission_id": mission_meta["mission_id"],
             "start_time": mission_meta["start_time"],
             "end_time": mission_meta["end_time"],
@@ -757,6 +784,9 @@ class CameraManager:
             "source_type": mission_meta["source_type"],
             "source_name": mission_meta["source_name"],
             "resolution": mission_meta["resolution"],
+            "confidence": mission_meta.get("confidence"),  # Phase C
+            "frame_w": frame_w or None,   # Phase B
+            "frame_h": frame_h or None,   # Phase B
             "recording": mission_meta["recording"],
             "performance": {
                 "fps": round(inference_fps, 2),
@@ -788,6 +818,8 @@ class CameraManager:
             camera_type = source.info.type if source else None
             resolution = getattr(source, "resolution", None) if source else None
             confidence = self._confidence_threshold
+            frame_w = self._last_frame_w
+            frame_h = self._last_frame_h
             inference_fps = self._inference_fps
             inference_ms = self._inference_time_ms
             processing_latency_ms = self._processing_latency_ms
@@ -818,7 +850,9 @@ class CameraManager:
             "processing_latency_ms": round(processing_latency_ms, 2),
             "stream_fps": round(inference_fps, 2),
             "resolution": resolution,
-            "confidence": confidence,
+            "frame_w": frame_w or None,   # Phase B
+            "frame_h": frame_h or None,   # Phase B
+            "confidence": confidence,     # Phase C
             "object_count": len(detections),
             "class_counts": class_counts,
             "detections": detections,

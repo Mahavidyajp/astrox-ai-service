@@ -17,6 +17,9 @@ already produces the gated unique-track set and the per-class counts
 
 Nothing here is model-specific. Every class name comes from the count
 dicts CameraManager passes in.
+
+Phase A: set_video() records the finalized mission mp4 URL on stop().
+Phase C: begin(confidence=...) records the threshold the mission ran at.
 """
 
 from __future__ import annotations
@@ -161,6 +164,8 @@ class MissionRecorder:
         # Set by CameraManager._finalize_recording() on stop() once a
         # usable mp4 exists. Relative URL, resolved by the frontend.
         self._video_url: Optional[str] = None
+        # Phase C: confidence threshold this mission ran at.
+        self._confidence: Optional[float] = None
 
         self._engine = AlertEngine([])
         self._events: list = []
@@ -177,6 +182,7 @@ class MissionRecorder:
         resolution: Optional[str],
         recording_enabled: bool,
         alert_rules: Optional[list],
+        confidence: Optional[float] = None,
     ) -> None:
         self._active = True
         self._session_id = session_id
@@ -190,6 +196,7 @@ class MissionRecorder:
         self._resolution = resolution
         self._recording_enabled = bool(recording_enabled)
         self._video_url = None
+        self._confidence = confidence
 
         self._engine = AlertEngine(alert_rules)
         self._events = []
@@ -298,6 +305,7 @@ class MissionRecorder:
             "source_type": self._source_type,
             "source_name": self._source_name,
             "resolution": self._resolution,
+            "confidence": self._confidence,  # Phase C
             "recording": {
                 "enabled": self._recording_enabled,
                 "video_available": bool(vu),
