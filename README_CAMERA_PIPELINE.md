@@ -327,3 +327,92 @@ viewers (see `frame_buffer.py`).
 5. Restart the backend — `detector.py`, `video_detector.py`, and the
    Node history backend were never touched, so nothing else needs
    reverting.
+
+## 11. Connect Drone (dynamic RTSP — standalone/GCS Phase 1)
+
+Lets an operator enter a drone's RTSP connection details at runtime
+(no SSH, no hand-editing `cameras.yaml`, no restart) instead of
+requiring the camera to be pre-configured before the service starts.
+Built entirely on the existing RTSP pipeline (`camera/rtsp_source.py`)
+and camera registry (`camera/config.py`) — no new ingestion mechanism.
+
+**`POST /webcam/rtsp/test`** — throwaway probe, does not affect any
+running mission or write anything to disk.
+
+```json
+// request
+{
+  "url": "rtsp://192.168.0.10:8554/H264Video",
+  "username": null,
+  "password": null,
+  "protocol": "tcp",
+  "codec": null            // omit/null to try h264 then h265 automatically
+}
+```
+```json
+// response — success
+{ "success": true, "codec": "h264", "protocol": "tcp", "resolution": "1920x1080", "fps": 29.8 }
+// response — failure (never contains the password)
+{ "success": false, "error": "'rtspsrc location=\"rtsp://***:***@192.168.0.10:8554/H264Video\" ...' failed to reach PLAYING state ..." }
+```
+
+Takes up to ~10s per codec attempt (worst case ~20s if both h264 and
+h265 are tried and both fail) — the frontend should show a spinner /
+disable the button, not assume this is instant.
+
+**`POST /webcam/rtsp/connect`** — persists the camera the operator
+just tested. Writes ONE fixed-id entry, `"connected-drone"`, into
+`cameras.yaml`'s `rtsp_cameras:` list via `upsert_rtsp_camera()`;
+reconnecting (a different drone, or the same one after a drop)
+overwrites that same entry rather than accumulating one per attempt —
+correct for Phase 1's "one GCS, one active drone." Any statically
+pre-configured cameras already in `cameras.yaml` (CSI, other RTSP
+entries) are left untouched.
+
+```json
+// request
+{
+  "name": "Skydroid H16-01",
+  "url": "rtsp://192.168.0.10:8554/H264Video",
+  "username": null,
+  "password": null,
+  "protocol": "tcp",
+  "codec": "h264",           // use whatever /webcam/rtsp/test reported
+  "rtsp_latency_ms": 100
+}
+```
+```json
+// response — never echoes the URL or credentials back
+{ "success": true, "camera_id": "connected-drone", "name": "Skydroid H16-01" }
+```
+
+From there it's an ordinary camera: `GET /webcam/cameras` will list
+it, `GET /webcam/start?camera_id=connected-drone` starts it exactly
+like any pre-configured RTSP entry — nothing downstream (MediaMTX,
+GStreamer, the detections WebSocket, mission recording) needed to
+change.
+
+**Manual test:**
+```bash
+curl -s -X POST http://localhost:8000/webcam/rtsp/test \
+  -H "Content-Type: application/json" \
+  -d '{"url":"rtsp://192.168.0.10:8554/H264Video","protocol":"tcp"}' | python3 -m json.tool
+
+curl -s -X POST http://localhost:8000/webcam/rtsp/connect \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Skydroid H16-01","url":"rtsp://192.168.0.10:8554/H264Video","codec":"h264","protocol":"tcp"}'
+
+curl -s http://localhost:8000/webcam/start?camera_id=connected-drone
+```
+
+**Credential handling** — username/password are separate fields the
+whole way through; they're combined into `rtsp://user:pass@host/...`
+exactly once, server-side, by `camera/rtsp_source.py`'s
+`build_rtsp_url()`. That combined URL is written to `cameras.yaml`
+and handed to GStreamer — it is never included in an API response.
+Every place the URL could otherwise leak into a log line or an error
+message (the GStreamer pipeline log, three different `CameraError`
+messages, and the GStreamer bus error text) is redacted through
+`camera/base.py`'s `_redact_credentials_in_text()` — this was a real
+gap found during implementation, not a hypothetical: the pipeline-start
+log line previously logged the credentialed URL in plaintext.

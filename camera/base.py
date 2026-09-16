@@ -11,6 +11,7 @@ else changes.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -84,6 +85,22 @@ def _redact_credentials(url: str) -> str:
     if ":" in creds:
         return f"{scheme}***:***@{host_and_path}"
     return url
+
+
+# Unlike _redact_credentials (which assumes the ENTIRE input is one bare
+# URL — used for CameraInfo.public_dict()), this masks any
+# scheme://user:pass@ occurrence *embedded inside* a larger free-text
+# string: a full GStreamer pipeline description, a GLib parse error, or
+# a GStreamer bus error/debug message. Any place a camera's RTSP url is
+# interpolated into something that ends up logged or surfaced through
+# an API error field must go through this first.
+_CREDENTIALED_URL_RE = re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://)([^:/@\s"\']+):([^@/\s"\']+)@')
+
+
+def _redact_credentials_in_text(text: str) -> str:
+    if not text or "@" not in text:
+        return text
+    return _CREDENTIALED_URL_RE.sub(r"\1***:***@", text)
 
 
 class CameraSource(ABC):
@@ -183,11 +200,16 @@ class GStreamerSource(CameraSource):
         )
 
     def _start_pipeline(self, pipeline_str: str) -> None:
-        logger.info("Starting GStreamer pipeline for %s: %s", self.info.id, pipeline_str)
+        logger.info(
+            "Starting GStreamer pipeline for %s: %s",
+            self.info.id, _redact_credentials_in_text(pipeline_str),
+        )
         try:
             self._pipeline = Gst.parse_launch(pipeline_str)
         except GLib.Error as exc:
-            raise CameraError(f"Failed to parse GStreamer pipeline: {exc}") from exc
+            raise CameraError(
+                f"Failed to parse GStreamer pipeline: {_redact_credentials_in_text(str(exc))}"
+            ) from exc
 
         self._appsink = self._pipeline.get_by_name("sink")
         if self._appsink is None:
@@ -209,10 +231,12 @@ class GStreamerSource(CameraSource):
         self._loop_thread = threading.Thread(target=self._loop.run, daemon=True)
         self._loop_thread.start()
 
+        safe_pipeline_str = _redact_credentials_in_text(pipeline_str)
+
         ret = self._pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
             raise CameraError(
-                f"'{pipeline_str}' failed to reach PLAYING state synchronously "
+                f"'{safe_pipeline_str}' failed to reach PLAYING state synchronously "
                 "(usually a caps negotiation failure — the device doesn't support the "
                 "requested width/height/framerate/format combination, or is busy)."
             )
@@ -221,13 +245,13 @@ class GStreamerSource(CameraSource):
         # fails fast instead of the caller finding out 5s later via /status.
         state_change_ok, _, _ = self._pipeline.get_state(timeout=5 * Gst.SECOND)
         if state_change_ok == Gst.StateChangeReturn.FAILURE:
-            raise CameraError(f"'{pipeline_str}' failed during PREROLL.")
+            raise CameraError(f"'{safe_pipeline_str}' failed during PREROLL.")
         if state_change_ok != Gst.StateChangeReturn.SUCCESS:
             # ASYNC/NO_PREROLL after the timeout means it never actually got
             # there either — treat as failure so we fall through to the next
             # candidate instead of reporting a fake success.
             raise CameraError(
-                f"'{pipeline_str}' did not reach PLAYING within 5s "
+                f"'{safe_pipeline_str}' did not reach PLAYING within 5s "
                 f"(state_change_return={state_change_ok})."
             )
 
@@ -265,7 +289,12 @@ class GStreamerSource(CameraSource):
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            self._error = f"{err.message} ({debug})" if debug else err.message
+            raw = f"{err.message} ({debug})" if debug else err.message
+            # GStreamer's own error/debug text isn't guaranteed not to echo
+            # the pipeline's "location=..." property (e.g. rtspsrc auth
+            # failures sometimes include it) — redact defensively rather
+            # than assuming it's clean.
+            self._error = _redact_credentials_in_text(raw)
             logger.error("GStreamer error on %s: %s", self.info.id, self._error)
             self._running = False
         elif t == Gst.MessageType.EOS:
