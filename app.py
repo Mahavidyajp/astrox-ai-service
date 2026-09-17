@@ -68,7 +68,7 @@ app.add_middleware(
 
 MODEL_PATH = os.getenv(
     "MODEL_PATH",
-    "best.engine"
+    "models/best.engine"
 )
 
 detector = Detector(MODEL_PATH)
