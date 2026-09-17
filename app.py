@@ -4,6 +4,7 @@ import traceback
 import shutil
 import uuid
 import os
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -17,7 +18,8 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from detector import Detector
 from video_detector import process_video
-from camera import CameraManager, CameraError
+from camera import CameraManager, CameraError, CameraInfo, RTSPCameraSource, build_rtsp_url, upsert_rtsp_camera
+from camera.base import _redact_credentials_in_text
 from camera.manager import MISSION_RECORD_DIR
 from camera.webrtc import (
     LatestFrameVideoTrack,
@@ -302,6 +304,149 @@ def webcam_cameras():
     except Exception as e:
         traceback.print_exc()
         return {"success": False, "error": str(e), "cameras": []}
+
+
+# ============================================================
+# CONNECT DRONE  (dynamic RTSP — standalone/GCS Phase 1)
+#
+# Two routes, two different jobs:
+#   /webcam/rtsp/test    — throwaway probe. Builds a RTSPCameraSource
+#     that is NEVER handed to camera_manager, so it can't touch an
+#     active mission. Tries the requested codec, then the other one,
+#     reads back real resolution/fps from the negotiated stream, tears
+#     down immediately either way.
+#   /webcam/rtsp/connect — persists a camera the operator has already
+#     tested. Writes ONE fixed-id entry ("connected-drone") into
+#     cameras.yaml via upsert_rtsp_camera() (Phase 1 = one active
+#     drone; reconnecting overwrites the same entry rather than
+#     accumulating one per attempt). From there it's just another
+#     camera_id — /webcam/cameras and /webcam/start need no changes.
+#
+# Credential handling: username/password arrive as separate fields and
+# are combined into the URL exactly once, server-side, by
+# build_rtsp_url(). The combined URL is written to cameras.yaml and
+# handed to GStreamer — it is never sent back in a response. Every
+# error string below is passed through _redact_credentials_in_text()
+# before it leaves this process, on top of the redaction already done
+# inside camera/base.py.
+# ============================================================
+
+_RTSP_CODECS = ("h264", "h265")
+_RTSP_PROTOCOLS = ("tcp", "udp")
+CONNECTED_DRONE_CAMERA_ID = "connected-drone"
+
+
+class RTSPTestRequest(BaseModel):
+    url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    protocol: str = "tcp"
+    codec: Optional[str] = None  # None = try both, h264 first
+
+
+class RTSPConnectRequest(BaseModel):
+    name: str = "Connected Drone"
+    url: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    protocol: str = "tcp"
+    codec: str = "h264"
+    rtsp_latency_ms: int = 100
+
+
+def _probe_rtsp_once(url: str, protocol: str, codec: str, latency_ms: int = 100):
+    """Start a throwaway RTSPCameraSource, wait for a handful of frames,
+    then tear it down. Returns (ok: bool, info: dict, error: Optional[str]).
+    Never raises — every failure path is caught and redacted."""
+    probe_info = CameraInfo(id="rtsp-test-probe", type="RTSP", name="Connect Drone test", url=url)
+    try:
+        source = RTSPCameraSource(probe_info, url=url, latency_ms=latency_ms, protocol=protocol, codec=codec)
+        source.start()
+    except CameraError as exc:
+        return False, {}, _redact_credentials_in_text(str(exc))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("Unexpected error probing RTSP camera")
+        return False, {}, _redact_credentials_in_text(str(exc))
+
+    try:
+        first = source.get_latest_frame(timeout=5.0)
+        if first is None:
+            err = source.last_error or "No video frame received within 5s."
+            return False, {}, _redact_credentials_in_text(err)
+
+        timestamps = [first.timestamp]
+        for _ in range(4):
+            fo = source.get_latest_frame(timeout=1.0)
+            if fo is not None:
+                timestamps.append(fo.timestamp)
+
+        fps = None
+        if len(timestamps) >= 2:
+            span = timestamps[-1] - timestamps[0]
+            if span > 0:
+                fps = round((len(timestamps) - 1) / span, 1)
+
+        return True, {
+            "codec": codec,
+            "protocol": protocol,
+            "resolution": source.resolution,
+            "fps": fps,
+        }, None
+    finally:
+        try:
+            source.stop()
+        except Exception:
+            logger.exception("Error stopping RTSP test probe")
+
+
+@app.post("/webcam/rtsp/test")
+def webcam_rtsp_test(req: RTSPTestRequest):
+    try:
+        url = build_rtsp_url(req.url, req.username, req.password)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    protocol = req.protocol if req.protocol in _RTSP_PROTOCOLS else "tcp"
+    codecs_to_try = [req.codec] if req.codec in _RTSP_CODECS else list(_RTSP_CODECS)
+
+    last_error = "Unable to connect to RTSP stream."
+    for codec in codecs_to_try:
+        ok, info, error = _probe_rtsp_once(url, protocol, codec)
+        if ok:
+            return {"success": True, **info}
+        last_error = error or last_error
+
+    return {"success": False, "error": last_error}
+
+
+@app.post("/webcam/rtsp/connect")
+def webcam_rtsp_connect(req: RTSPConnectRequest):
+    try:
+        url = build_rtsp_url(req.url, req.username, req.password)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
+    protocol = req.protocol if req.protocol in _RTSP_PROTOCOLS else "tcp"
+    codec = req.codec if req.codec in _RTSP_CODECS else "h264"
+    name = req.name.strip() if req.name and req.name.strip() else "Connected Drone"
+
+    entry = {
+        "id": CONNECTED_DRONE_CAMERA_ID,
+        "name": name,
+        "url": url,
+        "codec": codec,
+        "rtsp_latency_ms": int(req.rtsp_latency_ms),
+        "rtsp_protocol": protocol,
+    }
+    try:
+        upsert_rtsp_camera(entry)
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception:
+        logger.exception("Failed to write cameras.yaml for Connect Drone")
+        return {"success": False, "error": "Could not save the camera configuration."}
+
+    return {"success": True, "camera_id": CONNECTED_DRONE_CAMERA_ID, "name": name}
 
 
 # ============================================================

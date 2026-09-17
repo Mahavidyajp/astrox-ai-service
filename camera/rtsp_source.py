@@ -44,12 +44,54 @@ branch for rtpjpegdepay/jpegdec if needed.
 
 from __future__ import annotations
 
+from typing import Optional
+from urllib.parse import quote
+
 from .base import CameraInfo, GStreamerSource
 
 _DEPAY = {
     "h264": "rtph264depay ! h264parse",
     "h265": "rtph265depay ! h265parse",
 }
+
+
+def build_rtsp_url(url: str, username: Optional[str] = None, password: Optional[str] = None) -> str:
+    """Combine a bare RTSP URL with optional, separately-supplied
+    username/password into rtsp://user:pass@host/... .
+
+    This exists so the "Connect Drone" frontend form (and the
+    /webcam/rtsp/test and /webcam/rtsp/connect routes) never has to
+    build a credentialed URL itself — username and password stay two
+    separate fields end-to-end until this function combines them,
+    once, server-side.
+
+    - No `username` -> `url` is returned exactly as given, so a stream
+      with no auth (or one where the operator already pasted a
+      pre-composed rtsp://user:pass@host URL) works unchanged.
+    - `username` given -> any credentials already embedded in `url`
+      are replaced (not doubled up) with the supplied ones.
+    - Both parts are percent-encoded (urllib.parse.quote) so a
+      password containing "@", ":" or "/" can't corrupt the URL or be
+      misread as part of the host/path.
+
+    Raises ValueError if `url` has no "scheme://" — fails fast rather
+    than silently building a malformed pipeline location.
+    """
+    if not username:
+        return url
+
+    scheme_sep = url.find("://")
+    if scheme_sep == -1:
+        raise ValueError(f"Invalid RTSP URL (missing scheme): {url!r}")
+    scheme = url[: scheme_sep + 3]
+    rest = url[scheme_sep + 3 :]
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+
+    user_enc = quote(username, safe="")
+    if password:
+        return f"{scheme}{user_enc}:{quote(password, safe='')}@{rest}"
+    return f"{scheme}{user_enc}@{rest}"
 
 
 def _build_pipeline(
